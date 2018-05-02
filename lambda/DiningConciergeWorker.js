@@ -8,6 +8,19 @@ var sqs = new AWS.SQS({region: AWS_REGION});
 var sns = new AWS.SNS({region: AWS_REGION});
 var ses = new AWS.SES({region: AWS_REGION});
 
+var connectionClass = require('http-aws-es');
+var elasticsearch = require('elasticsearch');
+var es = new elasticsearch.Client({  
+    host: 'search-aichat-6ly4xt7urxm566av5c6jaz2sii.us-east-1.es.amazonaws.com',
+    log: 'trace',
+    connectionClass: connectionClass,
+    amazonES: {
+      credentials: new AWS.EnvironmentCredentials('AWS')
+    }
+});
+
+var dynamodb = new AWS.DynamoDB();
+
 function deleteMessage(receiptHandle, cb) {
   sqs.deleteMessage({
     ReceiptHandle: receiptHandle,
@@ -15,9 +28,7 @@ function deleteMessage(receiptHandle, cb) {
   }, cb);
 }
 
-function work(task, cb) {
-  console.log(task);
-  
+function work(task, callback) {
   task.location = task.location.trim().replace(/[ ]/g,"");
   task.cuisine = task.cuisine.trim().replace(/[ ]/g,"");
   task.phone = task.phone.trim().replace(/[ ]/g,"");
@@ -33,35 +44,67 @@ function work(task, cb) {
   }
   
   var message=`Hello! Here are my ${task.cuisine} restaurant suggestions for ${task.number} people, for today at ${task.time}:`;
-  var options = {
-    host: 'api.yelp.com',
-    path: `/v3/businesses/search?limit=1&location=${task.location}&term=${task.cuisine}`,  
-    method: 'GET',
-    headers:{
-      'Authorization':'Bearer r_nnzbDGpT6_jtykd6HrokZJRdIHG7qLoblsrJRaV9DSA_H--0BVPAzpYHnUd11lQdGSLOK8nUqyhPwl-Zj13w0IL65YeFwT6-BCYfVzvCmzG-sM_cCEaAIwgN2pWnYx'
+
+  es.search({
+    index: 'predictions',
+    type: 'Prediction',
+    body: {
+      query: {
+        match: {
+          Cuisine: task.cuisine
+        }
+      }
     }
-  };
-  
-  var req = https.request(options, function (res) {
-  console.log('STATUS: ' + res.statusCode);
-  console.log('HEADERS: ' + JSON.stringify(res.headers));
-  res.setEncoding('utf8');
-  res.on('data', function (chunk) {
-    console.log(typeof(chunk));
-    console.log(chunk);
-    var yelp=JSON.parse(chunk);
-    
-    console.log('BODY: ' + yelp.businesses);
-    for(var i=0;i<yelp.businesses.length;i++)
-    {
-      message += ` ${i+1}. name: ${yelp.businesses[i].name}   location: ${yelp.businesses[i].location.address1}   phone: ${yelp.businesses[i].phone}`
+  }).then(function (body) {
+    console.log(body.hits);
+    var restaurantid = [];
+    for (var i in body.hits.hits){
+      restaurantid.push({
+        "RestaurantID": {
+         S: body.hits.hits[i]._id
+        }
+      })
     }
-    console.log(message);
-    
     var params = {
+  RequestItems: {
+   "aichat": {
+     Keys: restaurantid
+    }
+  }
+ };
+ dynamodb.batchGetItem(params, function(err, data) {
+   console.log(data.Responses.aichat);
+   loadMessages(err, data.Responses.aichat, message, task.phone, task.email, callback);
+ });
+    // for (var i in body.hits.hits){
+    //   dynamo.query({
+    //     TableName: 'aichat',
+    //     KeyConditionExpression: 'RestaurantID = :id',
+    //     ExpressionAttributeValues: {':id': {S: body.hits.hits[i]._id}}, 
+    //   }, function (err, data) {
+    //     loadMessages(err,data,body.hits.hits[i]._id,[],callback);
+    //   });
+    // }
+  });
+}
+  
+function loadMessages(err, data, message, phone, email, callback) {
+    if (err === null) {
+      var i=0;
+        data.forEach(function (result) {
+            message += `\n${i+1}. name: ${result.name.S}   `;
+            message += `address: ${result.location.S}   `
+            message += `coordinates: latitude :${(JSON.parse(result.coordinates.S)).latitude} longitude :${(JSON.parse(result.coordinates.S)).longitude}   `
+            message += `zipcode: ${result.zipCode.S}   `;
+            message += `reviews: ${result.reviews.S}   `;
+            message += `rating: ${result.rating.S}`;
+            i += 1;
+        });
+        console.log(message);
+            var params = {
       Message: message,
       MessageStructure: 'string',
-      PhoneNumber: task.phone
+      PhoneNumber: phone
     };
     
     sns.publish(params, function(err, data) {
@@ -73,7 +116,7 @@ function work(task, cb) {
     
     var eParams = {
         Destination: {
-            ToAddresses: [task.email]
+            ToAddresses: [email]
         },
         Message: {
             Body: {
@@ -94,19 +137,13 @@ function work(task, cb) {
             console.log("===EMAIL SENT===");
             console.log(data);
             console.log("EMAIL CODE END");
-            console.log('EMAIL: ', email);
         }
     });
-    
-    }); 
-  });
-  
-  req.on('error', function (e) {  
-    console.log('problem with request: ' + e.message);  
-  });
-  
-  req.end();
-  cb();
+        
+        callback(null);
+    } else {
+        callback(err);
+    }
 }
 
 exports.handler = function(event, context, callback) {
